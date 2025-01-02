@@ -12,7 +12,7 @@ class ApproachObject(py_trees.behaviour.Behaviour):
 
     def update(self):
         self.t2 = time.time()
-        if self.t2 - self.t1 > 3:
+        if self.t2 - self.t1 > 10:
             self.done = True
         if self.done:
             print("Reached")
