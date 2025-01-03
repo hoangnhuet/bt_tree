@@ -2,7 +2,10 @@
     <BehaviorTree ID="MainTree">
         <Sequence name="GotoPose">
             <CheckCondition name="Check Condition"/>
-            <MovingToPose name="Moving To Pose" x="1.0" y="2.0" yaw="0.0"/>
+            <MovingToPose name="Moving To Pose" x="-1.0" y="-2.0" yaw="0.5"/>
+            <HumanDetection name="Human Detection"/>
+            <MovingToPose name="Moving To Pose" x="-1.0" y="-2.0" yaw="-0.5"/>
+            <HumanDetection name="Human Detection"/>
         </Sequence>
     </BehaviorTree>
 </root>

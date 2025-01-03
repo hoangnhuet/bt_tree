@@ -3,41 +3,11 @@ import xml.etree.ElementTree as ET
 import time
 import math
 import rclpy
-import rclpy.clock
 from rclpy.node import Node
 from rclpy.action import ActionClient
 from nav2_msgs.action import NavigateToPose
 from geometry_msgs.msg import PoseStamped, Point, Quaternion
-from std_msgs.msg import Float32
-
-class HumanDetection(py_trees.behaviour.Behaviour):
-    # Simulated the human detection behavior, sub to ros topic type Float 32, if it have been published, return SUCCESS if value > 0, 
-    #, value < 0 return FAILURE and otherwise return RUNNING
-    def __init__(self, name):
-        super(HumanDetection, self).__init__(name)
-        self.node = Node('human_detecttion')
-        self.sub = self.node.create_subscription(Float32, "human_detection", self.callback, 10)
-        self.value = 0.0
-        self.time1 = 0.0
-        self.flag = False
-    def callback(self, msg):
-        self.value = msg.data
-        print("value: ", self.value)
-    def update(self):
-        rclpy.spin_once(self.node, timeout_sec=1.0)
-        if self.value > 0:
-            if not self.flag:
-                self.time1 = time.time()
-                self.flag = True
-            if time.time() - self.time1 >5:
-                return py_trees.common.Status.SUCCESS
-            else:
-                print("Confirming.....")
-                return py_trees.common.Status.RUNNING
-        elif self.value < 0:
-            return py_trees.common.Status.FAILURE
-        else:
-            return py_trees.common.Status.RUNNING
+import threading
 
 class CheckCondition(py_trees.behaviour.Behaviour):
     def __init__(self, name):
@@ -45,24 +15,24 @@ class CheckCondition(py_trees.behaviour.Behaviour):
         self.t1 = time.time()
         self.t2 = 0.0
         self.done = False
-        
+
     def update(self):
         self.t2 = time.time()
         if self.t2 - self.t1 > 5:
             self.done = True
-        
+
         if self.done:
             return py_trees.common.Status.SUCCESS
         else:
             return py_trees.common.Status.RUNNING
 
 class MovingToPose(py_trees.behaviour.Behaviour):
-    def __init__(self, name, pose, context = None):
+    def __init__(self, name, pose, context=None):
         super(MovingToPose, self).__init__(name)
         # if context is None:
         #     rclpy.init()
         self.context = context
-        self.node = Node('simple_bt_nav_client')
+        self.node = Node('simple_bt_nav_client_' + name)
         self.action_client = ActionClient(self.node, NavigateToPose, 'navigate_to_pose')
         self.node.get_logger().info('Waiting for action server...')
         self.action_client.wait_for_server()
@@ -71,29 +41,46 @@ class MovingToPose(py_trees.behaviour.Behaviour):
         self.goal_msg.pose = self.pose
         self.node.get_logger().info('Sending goal...')
         self.send_goal_future = self.action_client.send_goal_async(self.goal_msg)
-        rclpy.spin_until_future_complete(self.node, self.send_goal_future)
-        self.goal_handle = self.send_goal_future.result()
+        self.send_goal_future.add_done_callback(self.goal_response_callback)
+        self.goal_handle = None
+        self.get_result_future = None
+        self.done = False
+        self.result = None
+
+    def goal_response_callback(self, future):
+        self.goal_handle = future.result()
         if not self.goal_handle or not self.goal_handle.accepted:
             self.node.get_logger().info('FAILURE - goal rejected')
-            if self.context is None:
-                rclpy.shutdown()
+            self.done = True
+            self.result = None
             return
+        self.node.get_logger().info('Goal accepted')
         self.get_result_future = self.goal_handle.get_result_async()
-        self.done = False
-        
-        
+        self.get_result_future.add_done_callback(self.get_result_callback)
+
+    def get_result_callback(self, future):
+        self.done = True
+        self.result = future.result()
+
     def update(self):
-        if not self.get_result_future.done():
-            self.node.get_logger().info('RUNNING')
-            rclpy.spin_once(self.node, timeout_sec=1.0)
+        if self.get_result_future is None:
             return py_trees.common.Status.RUNNING
-        else:
-            result = self.get_result_future.result()
-            if result.status == 4:
-                return py_trees.common.Status.SUCCESS
-            else:
+
+        if self.get_result_future.done():
+            if self.result is None:
                 return py_trees.common.Status.FAILURE
- 
+            if self.result.status == 4:  # SUCCESS
+                self.node.get_logger().info('Action Succeeded')
+                return py_trees.common.Status.SUCCESS
+            elif self.result.status == 6:  # ABORTED
+                self.node.get_logger().info('Action Aborted')
+                return py_trees.common.Status.FAILURE
+            else:
+                self.node.get_logger().info(f'Action status: {self.result.status}')
+                return py_trees.common.Status.FAILURE
+        else:
+            self.node.get_logger().info('Action Running')
+            return py_trees.common.Status.RUNNING
 
 def EulerToQuat(roll, pitch, yaw):
     cy = math.cos(yaw * 0.5)
@@ -109,7 +96,7 @@ def EulerToQuat(roll, pitch, yaw):
     q.w = cy * cp * cr + sy * sp * sr
     return q
 
-def create_node_from_xml(node_element):
+def create_node_from_xml(node_element, executor=None):
     node_type = node_element.tag
     node_name = node_element.attrib['name']
     
@@ -124,19 +111,28 @@ def create_node_from_xml(node_element):
         pose.header.stamp = rclpy.clock.Clock().now().to_msg()
         pose.pose.position = Point(x=float(node_x), y=float(node_y), z=0.0)
         pose.pose.orientation = EulerToQuat(0, 0, float(node_yaw))
-        return MovingToPose(name=node_name, pose = pose)
-    elif node_type == 'HumanDetection':
-        return HumanDetection(name=node_name)
+        moving_to_pose = MovingToPose(name=node_name, pose=pose)
+        if executor is not None:
+            executor.add_node(moving_to_pose.node)
+        return moving_to_pose
     elif node_type == 'Sequence':
         return py_trees.composites.Sequence(name=node_name, memory=True)
     else:
         raise ValueError(f"Invalid node type: {node_type}")
 
-def build_tree_from_xml(xml_path):
+def build_subtree(parent_node, xml_node_element, executor=None):
+    """Recursively build the subtree from XML elements."""
+    for child in xml_node_element:
+        # Create a py_trees node from the XML child element
+        py_tree_child = create_node_from_xml(child, executor)
+        # Add the created node as a child to the parent node
+        parent_node.add_child(py_tree_child)
+        # Recursively build the subtree for this node
+        build_subtree(py_tree_child, child, executor)
+
+def build_tree_from_xml(xml_path, executor=None):
     tree = ET.parse(xml_path)
-    # print(tree)
     root = tree.getroot()
-    print(tree.getroot())
     
     # Find the main behavior tree
     main_tree_id = root.get('main_tree_to_execute')
@@ -146,24 +142,13 @@ def build_tree_from_xml(xml_path):
         raise ValueError("Main behavior tree not found in XML")
     
     # Get the first child (root node) of the behavior tree
-    # print("bt tree",behavior_tree)
     root_element = behavior_tree[0]
-    root_node = create_node_from_xml(root_element)
+    root_node = create_node_from_xml(root_element, executor)
     
     # Build the complete tree
-    build_subtree(root_node, root_element)
+    build_subtree(root_node, root_element, executor)
     
     return py_trees.trees.BehaviourTree(root_node)
-
-def build_subtree(parent_node, xml_node_element):
-    """Recursively build the subtree from XML elements."""
-    for child in xml_node_element:
-        # Create a py_trees node from the XML child element
-        py_tree_child = create_node_from_xml(child)
-        # Add the created node as a child to the parent node
-        parent_node.add_child(py_tree_child)
-        # Recursively build the subtree for this node
-        build_subtree(py_tree_child, child)
 
 def print_tree_status(root):
     """Print the current status of the behavior tree."""
@@ -174,28 +159,40 @@ def print_tree_status(root):
         print(f"{node.name}: {status}")
     print("---------------------")
 
+def ros_spin(executor):
+    """Function to spin the ROS executor."""
+    executor.spin()
+
 def main():
     rclpy.init()
-    tree = build_tree_from_xml("mobile_robot.xml")
+
+    # Create a MultiThreadedExecutor
+    executor = rclpy.executors.MultiThreadedExecutor()
     
-    # Tick the tree
+    # Create main node if needed
+    main_node = Node('main_node')
+    executor.add_node(main_node)
+    
+    # Parse and build the tree from the XML file, passing the executor
+    tree = build_tree_from_xml("mobile_robot.xml", executor)
+    
+    # Create and start a separate thread to spin ROS
+    ros_thread = threading.Thread(target=ros_spin, args=(executor,), daemon=True)
+    ros_thread.start()
+    
+    # Tick the Behavior Tree in the main thread
     try:
-        for i in range(1000): 
+        for i in range(10):  # Run for 10 ticks
             print(f"\nTree tick {i+1}")
             tree.tick()
             print_tree_status(tree.root)
-            if tree.root.status == py_trees.common.Status.SUCCESS:
-                print("Behavior Tree succeeded.")
-                break
-            if tree.root.status == py_trees.common.Status.FAILURE:
-                print("Behavior Tree failed.")
-                break
             time.sleep(1)
     except KeyboardInterrupt:
         print("Behavior Tree stopped.")
+    
+    # Shutdown executor and ROS
+    executor.shutdown()
     rclpy.shutdown()
 
 if __name__ == "__main__":
     main()
-
-        
