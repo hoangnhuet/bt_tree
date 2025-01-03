@@ -3,11 +3,14 @@ import xml.etree.ElementTree as ET
 import time
 import math
 import rclpy
-import rclpy.clock
+import threading
 from rclpy.node import Node
+from rclpy.executors import MultiThreadedExecutor
+from rclpy.callback_groups import MutuallyExclusiveCallbackGroup
 from rclpy.action import ActionClient
 from nav2_msgs.action import NavigateToPose
 from geometry_msgs.msg import PoseStamped, Point, Quaternion
+
 class CheckCondition(py_trees.behaviour.Behaviour):
     def __init__(self, name):
         super(CheckCondition, self).__init__(name)
@@ -26,43 +29,69 @@ class CheckCondition(py_trees.behaviour.Behaviour):
             return py_trees.common.Status.RUNNING
 
 class MovingToPose(py_trees.behaviour.Behaviour):
-    def __init__(self, name, pose, context = None):
+    def __init__(self, name, pose, context=None):
         super(MovingToPose, self).__init__(name)
-        if context is None:
-            rclpy.init()
         self.context = context
-        self.node = Node('simple_bt_nav_client')
-        self.action_client = ActionClient(self.node, NavigateToPose, 'navigate_to_pose')
-        self.node.get_logger().info('Waiting for action server...')
-        self.action_client.wait_for_server()
         self.pose = pose
-        self.goal_msg = NavigateToPose.Goal()
-        self.goal_msg.pose = self.pose
-        self.node.get_logger().info('Sending goal...')
-        self.send_goal_future = self.action_client.send_goal_async(self.goal_msg)
-        rclpy.spin_until_future_complete(self.node, self.send_goal_future)
-        self.goal_handle = self.send_goal_future.result()
-        if not self.goal_handle or not self.goal_handle.accepted:
-            self.node.get_logger().info('FAILURE - goal rejected')
-            if self.context is None:
-                rclpy.shutdown()
-            return
-        self.get_result_future = self.goal_handle.get_result_async()
-        self.done = False
+        self.node = None
+        self.action_client = None
+        self.get_result_future = None
+        self.setup_complete = False
         
+    def setup(self):
+        self.node = Node('simple_bt_nav_client')
+        callback_group = MutuallyExclusiveCallbackGroup()
+        self.action_client = ActionClient(
+            self.node, 
+            NavigateToPose, 
+            'navigate_to_pose',
+            callback_group=callback_group
+        )
+        self.setup_complete = False
+        
+        def setup_client():
+            self.node.get_logger().info('Waiting for action server...')
+            self.action_client.wait_for_server()
+            
+            goal_msg = NavigateToPose.Goal()
+            goal_msg.pose = self.pose
+            
+            self.node.get_logger().info('Sending goal...')
+            send_goal_future = self.action_client.send_goal_async(goal_msg)
+            rclpy.spin_until_future_complete(self.node, send_goal_future)
+            
+            goal_handle = send_goal_future.result()
+            if not goal_handle.accepted:
+                self.node.get_logger().error('Goal rejected!')
+                return
+                
+            self.get_result_future = goal_handle.get_result_async()
+            self.setup_complete = True
+            
+        # Run setup in a separate thread
+        setup_thread = threading.Thread(target=setup_client)
+        setup_thread.start()
         
     def update(self):
-        while not self.get_result_future.done():
-            self.node.get_logger().info('RUNNING')
-            rclpy.spin_once(self.node, timeout_sec=1.0)
-        result = self.get_result_future.result()
-        if result.status == 4:  # 4 -> SUCCESS
-            self.node.get_logger().info('SUCCESS')
-            return py_trees.common.Status.SUCCESS
-        elif result.status == 6:
-            return py_trees.common.Status.FAILURE
-        else:
+        if not self.setup_complete:
             return py_trees.common.Status.RUNNING
+            
+        if not self.get_result_future.done():
+            self.node.get_logger().info('RUNNING')
+            return py_trees.common.Status.RUNNING
+            
+        try:
+            result = self.get_result_future.result()
+            if result.status == 4:  # SUCCESS
+                self.node.get_logger().info('SUCCESS')
+                return py_trees.common.Status.SUCCESS
+            else:
+                return py_trees.common.Status.FAILURE
+        except Exception as e:
+            self.node.get_logger().error(f'Error getting result: {str(e)}')
+            return py_trees.common.Status.FAILURE
+        
+
 
 def EulerToQuat(roll, pitch, yaw):
     cy = math.cos(yaw * 0.5)
@@ -137,25 +166,40 @@ def print_tree_status(root):
         status = str(node.status) if node.status else 'UNKNOWN'
         print(f"{node.name}: {status}")
     print("---------------------")
+        
+
+
+def spin_ros(executor):
+    try:
+        executor.spin()
+    except Exception as e:
+        print(f"Executor exception: {str(e)}")
 
 def main():
-    # rclpy.init()
-    # Parse and build the tree from the XML file
+    rclpy.init()
+    
+    # Create multithreaded executor
+    executor = MultiThreadedExecutor()
+    
+    # Start executor in a separate thread
+    executor_thread = threading.Thread(target=spin_ros, args=(executor,))
+    executor_thread.start()
+    
+    # Parse and build the tree
     tree = build_tree_from_xml("mobile_robot.xml")
     
-    # Tick the tree
     try:
-        for i in range(10):  # Run for 10 ticks
+        for i in range(100):
             print(f"\nTree tick {i+1}")
             tree.tick()
             print_tree_status(tree.root)
             time.sleep(1)
     except KeyboardInterrupt:
         print("Behavior Tree stopped.")
-    rclpy.shutdown()
+    finally:
+        executor.shutdown()
+        rclpy.shutdown()
+        executor_thread.join()
 
 if __name__ == "__main__":
     main()
-
-        
-        
